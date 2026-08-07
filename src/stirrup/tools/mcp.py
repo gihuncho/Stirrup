@@ -29,8 +29,9 @@ Requires the optional `mcp` dependency:
     pip install stirrup[mcp]
 """
 
+import logging
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager, suppress
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -76,6 +77,8 @@ try:
 except ImportError:
     websocket_client = None  # ty: ignore[invalid-assignment]
 
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MCPConfig",
@@ -274,8 +277,12 @@ class MCPToolProvider(ToolProvider):
         process and returns, so the waiting happens in `initialize`, while that
         process starts up. Interleaving the two means each server's startup is
         paid end to end — connecting to N servers costs N startups rather than
-        the slowest one. With eight local stdio servers that measured 11.1s
-        against 3.2s.
+        the slowest one.
+
+        Stdio and Streamable HTTP gain from this. SSE and WebSocket do not:
+        their clients finish connecting before they yield their streams
+        (`mcp/client/sse.py`, `mcp/client/websocket.py`), so only the round
+        trips overlap.
 
         Only the handshakes run concurrently. Entering and unwinding the exit
         stack stays on this task, which is what anyio's cancel scopes require.
@@ -310,10 +317,11 @@ class MCPToolProvider(ToolProvider):
                 # itself than as a group of one, the way it did when the
                 # handshakes ran in sequence. Re-raised with the cause it
                 # already carries, so the error underneath and its traceback
-                # survive the unwrapping. Several at once keep the group, since
-                # picking one of them would be picking at random.
-                if len(group.exceptions) > 1:
-                    raise
+                # survive the unwrapping, and the group stays reachable as the
+                # new exception's context when more than one server failed —
+                # keeping the group instead would make the type a caller sees
+                # depend on whether two handshakes failed in the same
+                # scheduling window.
                 failure = group.exceptions[0]
                 raise failure from failure.__cause__
         except BaseException:
@@ -325,8 +333,14 @@ class MCPToolProvider(ToolProvider):
             # see. The stack keeps closing past them either way, and past a
             # cancellation, so a caller that gives up partway through leaves no
             # servers behind either.
-            with suppress(Exception):
+            try:
                 await stack.aclose()
+            except Exception as cleanup_error:
+                # Logged rather than swallowed: a transport complaining about a
+                # process that has already gone is noise, but a session that
+                # would not terminate is a leak on the far end, and the caller
+                # is about to be handed an unrelated error.
+                logger.warning("Error while closing MCP connections: %s", cleanup_error)
             raise
 
         # Recorded in configured order rather than in the order the handshakes
@@ -546,6 +560,8 @@ class MCPToolProvider(ToolProvider):
         """Enter async context: connect to MCP servers and return all tools.
 
         Fails the way `connect` does, leaving no servers running behind it.
+        That includes a tool whose schema will not build: it is turned into a
+        Tool here, inside the guard, rather than after it.
 
         Returns:
             List of Tool objects, one for each tool available across all connected servers.
@@ -553,9 +569,15 @@ class MCPToolProvider(ToolProvider):
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
-        await self._open_sessions(self._exit_stack)
-
-        return self.get_all_tools()
+        try:
+            await self._open_sessions(self._exit_stack)
+            return self.get_all_tools()
+        except BaseException:
+            try:
+                await self._exit_stack.aclose()
+            except Exception as cleanup_error:
+                logger.warning("Error while closing MCP connections: %s", cleanup_error)
+            raise
 
     async def __aexit__(
         self,

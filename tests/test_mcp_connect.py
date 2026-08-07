@@ -263,3 +263,63 @@ async def test_an_unknown_server_name_still_raises_keyerror(tmp_path: Path) -> N
     with pytest.raises(KeyError, match="not-in-config"):
         async with provider:
             pass
+
+
+def _write_unbuildable_server(script_path: Path, name: str) -> None:
+    """A server whose tool schema names a `$ref` that cannot be resolved.
+
+    Its handshake succeeds; the failure happens later, when the reported schema
+    is turned into a Tool.
+    """
+    script_path.write_text(
+        f"""
+import mcp.types as types
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
+import anyio
+
+app = Server("{name}")
+
+
+@app.list_tools()
+async def list_tools():
+    return [
+        types.Tool(
+            name="broken_{name}",
+            description="unbuildable",
+            inputSchema={{"type": "object", "properties": {{"x": {{"$ref": "#/$defs/nope"}}}}}},
+        )
+    ]
+
+
+async def main():
+    async with stdio_server() as (read, write):
+        await app.run(read, write, app.create_initialization_options())
+
+
+anyio.run(main)
+""".strip()
+    )
+
+
+async def test_a_tool_whose_schema_will_not_build_leaves_nothing_running(tmp_path: Path) -> None:
+    """The handshakes all succeed here; the failure comes afterwards, while the
+    reported schemas are turned into Tools. That step used to run outside the
+    cleanup, so every server it had just started stayed up."""
+    servers = _servers(tmp_path, 2)
+    broken = tmp_path / "broken.py"
+    _write_unbuildable_server(broken, "broken")
+    servers["broken"] = {"command": sys.executable, "args": [str(broken)]}
+    provider = MCPToolProvider(config=MCPConfig.model_validate({"mcpServers": servers}))
+
+    with pytest.raises(BaseException):  # noqa: B017 — the type is the SDK's, not ours
+        async with provider:
+            pass
+
+    pids = _spawned_pids(tmp_path)
+    survivors = [pid for pid in pids if _running(pid)]
+    for pid in survivors:
+        os.kill(pid, signal.SIGKILL)
+
+    assert len(pids) == 2, "the healthy servers never started, so this proves nothing"
+    assert survivors == [], "servers left running after a failed enter"

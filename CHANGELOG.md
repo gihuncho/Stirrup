@@ -67,6 +67,10 @@ actual emission order. `blocks` is the only stored content; the channel-era
 
 ### Fixed
 
+- `MCPToolProvider` connects to its servers concurrently. Entering a transport only spawns the process, so waiting for each one to answer before starting the next paid every server's startup end to end; eight local stdio servers went from 11.8s to 4.1s. Stdio and Streamable HTTP gain from this — SSE and WebSocket clients finish connecting before yielding their streams, so only their round trips overlap.
+- A server that fails to connect now raises `RuntimeError` naming it, with the underlying error as its cause. It was `McpError` through `__aenter__` and a doubly-nested `ExceptionGroup` through `connect()`, neither of which said which server.
+- A failed connect no longer leaves the servers that did start running behind it.
+
 - Responses client no longer joins all message items with `"\n"` or keeps only the
   last reasoning item — ordering and multiplicity survive capture and replay.
 - `SummaryMessage` / `TurnWarningMessage` now rehydrate as their own types through

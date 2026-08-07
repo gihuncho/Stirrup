@@ -30,7 +30,7 @@ Requires the optional `mcp` dependency:
 """
 
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -279,38 +279,72 @@ class MCPToolProvider(ToolProvider):
 
         Only the handshakes run concurrently. Entering and unwinding the exit
         stack stays on this task, which is what anyio's cancel scopes require.
+
+        Either every server connects or none does: nothing reaches the provider
+        until all of the handshakes are through, and anything already opened is
+        closed here if one of them is not.
         """
         config = self._config
         servers_to_connect = self._server_names or list(config.mcp_servers.keys())
 
         sessions: dict[str, ClientSession] = {}
-        for name in servers_to_connect:
-            if name not in config.mcp_servers:
-                raise KeyError(f"Server '{name}' not found in config. Available: {list(config.mcp_servers.keys())}")
-
-            read, write = await self._enter_transport(stack, name, config.mcp_servers[name])
-            sessions[name] = await stack.enter_async_context(ClientSession(read, write))
-
-        # A task group rather than asyncio.gather: mcp's transports are anyio
-        # based and so is this package, and a failure here should cancel the
-        # handshakes still in flight rather than leave them running while the
-        # exit stack unwinds. The group is unwrapped so callers keep seeing one
-        # exception rather than a group of one.
+        tools: dict[str, list[dict[str, Any]]] = {}
         try:
-            async with anyio.create_task_group() as task_group:
-                for name, session in sessions.items():
-                    task_group.start_soon(self._handshake, name, session)
-        except BaseExceptionGroup as group:
-            raise group.exceptions[0] from None
+            for name in servers_to_connect:
+                if name not in config.mcp_servers:
+                    raise KeyError(f"Server '{name}' not found in config. Available: {list(config.mcp_servers.keys())}")
 
+                read, write = await self._enter_transport(stack, name, config.mcp_servers[name])
+                sessions[name] = await stack.enter_async_context(ClientSession(read, write))
+
+            # A task group rather than asyncio.gather: mcp's transports are anyio
+            # based and so is this package, and a failure here should cancel the
+            # handshakes still in flight rather than leave them running while the
+            # exit stack unwinds.
+            try:
+                async with anyio.create_task_group() as task_group:
+                    for name, session in sessions.items():
+                        task_group.start_soon(self._handshake, name, session, tools)
+            except BaseExceptionGroup as group:
+                # One server failing is the ordinary case and reads better as
+                # itself than as a group of one, the way it did when the
+                # handshakes ran in sequence. Re-raised with the cause it
+                # already carries, so the error underneath and its traceback
+                # survive the unwrapping. Several at once keep the group, since
+                # picking one of them would be picking at random.
+                if len(group.exceptions) > 1:
+                    raise
+                failure = group.exceptions[0]
+                raise failure from failure.__cause__
+        except BaseException:
+            # Every transport was entered before any handshake ran, so by the
+            # time one fails the rest are already spawned and would outlive this
+            # call. Closing a half-open connection throws errors of its own (a
+            # transport complaining about the process that has already gone),
+            # and those must not stand in for the failure the caller needs to
+            # see. The stack keeps closing past them either way, and past a
+            # cancellation, so a caller that gives up partway through leaves no
+            # servers behind either.
+            with suppress(Exception):
+                await stack.aclose()
+            raise
+
+        # Recorded in configured order rather than in the order the handshakes
+        # happened to finish: `get_all_tools` walks this, so completion order
+        # would reshuffle the tools on every request the model is sent.
         for name, session in sessions.items():
             self._servers[name] = session
+            self._tools[name] = tools[name]
 
-    async def _handshake(self, name: str, session: ClientSession) -> None:
-        """Initialize one session and record the tools it reports.
+    async def _handshake(self, name: str, session: ClientSession, tools: dict[str, list[dict[str, Any]]]) -> None:
+        """Initialize one session and record the tools it reports in `tools`.
 
         The server is named in the failure: with several connecting at once,
         the underlying error alone does not say which one it came from.
+
+        Results are collected for the caller instead of being written to the
+        provider, which keeps both the ordering and the failure handling in one
+        place rather than in whichever task got there first.
         """
         try:
             await session.initialize()
@@ -318,9 +352,7 @@ class MCPToolProvider(ToolProvider):
         except Exception as exc:
             raise RuntimeError(f"MCP server '{name}' failed to connect: {exc}") from exc
 
-        self._tools[name] = [
-            {"name": t.name, "description": t.description, "schema": t.inputSchema} for t in response.tools
-        ]
+        tools[name] = [{"name": t.name, "description": t.description, "schema": t.inputSchema} for t in response.tools]
 
     async def _enter_transport(
         self, stack: AsyncExitStack, name: str, server_config: MCPServerConfig
@@ -370,12 +402,20 @@ class MCPToolProvider(ToolProvider):
     async def connect(self) -> AsyncIterator[Self]:
         """Connect to MCP servers from config file.
 
+        Nothing is left running behind a failure: if any server does not come
+        up, the ones that did are closed before the error is raised.
+
         Yields:
             Self with active connections to specified servers.
 
         Raises:
-            FileNotFoundError: If config file doesn't exist.
             KeyError: If a specified server name doesn't exist in config.
+            FileNotFoundError: If a stdio server's command doesn't exist.
+            ImportError: If a server needs the optional 'websockets' package and
+                it isn't installed.
+            TypeError: If a server is configured for an unsupported transport.
+            RuntimeError: If a server doesn't complete the MCP handshake. The
+                message names the server; the error it came from is the cause.
         """
         async with AsyncExitStack() as stack:
             await self._open_sessions(stack)
@@ -504,6 +544,8 @@ class MCPToolProvider(ToolProvider):
     # Tool lifecycle protocol implementation
     async def __aenter__(self) -> list[Tool[Any, ToolUseCountMetadata]]:
         """Enter async context: connect to MCP servers and return all tools.
+
+        Fails the way `connect` does, leaving no servers running behind it.
 
         Returns:
             List of Tool objects, one for each tool available across all connected servers.

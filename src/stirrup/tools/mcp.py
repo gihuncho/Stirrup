@@ -30,7 +30,7 @@ Requires the optional `mcp` dependency:
 """
 
 from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
@@ -54,7 +54,6 @@ try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.sse import sse_client
     from mcp.client.stdio import stdio_client
-    from mcp.client.streamable_http import streamablehttp_client
     from mcp.types import (
         AudioContent as MCPAudioContent,
     )
@@ -64,10 +63,38 @@ try:
     from mcp.types import (
         TextContent as MCPTextContent,
     )
+    from mcp.types import Tool as MCPTool
 except ImportError as e:
+    if e.name is not None and not e.name.startswith("mcp"):
+        raise
+    # Only a missing `mcp` means the extra is missing. A symbol that moved
+    # inside an installed mcp is a different problem, and reporting it as
+    # "install the extra" sends the reader to reinstall what they already have.
     raise ImportError(
         "Requires installation of the mcp extra. Install with (for example): `uv pip install stirrup[mcp]` or `uv add stirrup[mcp]`",
     ) from e
+
+# The Streamable HTTP client was renamed and its parameters changed: mcp 2.x has
+# `streamable_http_client`, taking a prepared httpx client, and yields two
+# streams. Recent 1.x ships both spellings but its new one still yields three.
+# So the name is resolved here, and the streams are taken by position below.
+try:
+    # ty resolves this against one mcp at a time and cannot see both spellings.
+    from mcp.client import streamable_http as _streamable_http
+    from mcp.client.streamable_http import (
+        create_mcp_http_client,
+        streamable_http_client,  # ty: ignore[unresolved-import]
+    )
+
+    # mcp 2.x vendors httpx as `httpx2`, and the Timeout handed to
+    # create_mcp_http_client has to come from whichever one it is using.
+    _httpx = getattr(_streamable_http, "httpx2", None) or _streamable_http.httpx
+    _STREAMABLE_HTTP_TAKES_HTTP_CLIENT = True
+except ImportError:  # mcp < 1.26
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+
+    create_mcp_http_client = None  # ty: ignore[invalid-assignment]
+    _STREAMABLE_HTTP_TAKES_HTTP_CLIENT = False
 
 # WebSocket client requires additional 'websockets' package
 try:
@@ -206,6 +233,44 @@ class MCPConfig(BaseModel):
 # === Manager ===
 
 
+def _tool_input_schema(tool: MCPTool) -> dict[str, Any]:
+    """The tool's JSON Schema, under whichever name the installed mcp uses.
+
+    mcp 2.x renamed `inputSchema` to `input_schema`.
+    """
+    schema = getattr(tool, "input_schema", None)
+    if schema is None:
+        schema = tool.inputSchema
+    return schema
+
+
+def _streamable_http_streams(
+    config: StreamableHttpServerConfig,
+) -> AbstractAsyncContextManager[tuple[Any, ...]]:
+    """The Streamable HTTP transport, spelled the way the installed mcp wants.
+
+    mcp 2.x takes a prepared httpx client instead of headers and timeouts, so
+    the configured values are folded into one. `sse_read_timeout` becomes that
+    client's read timeout, which is what it bounded before.
+    """
+    if _STREAMABLE_HTTP_TAKES_HTTP_CLIENT:
+        return streamable_http_client(
+            url=config.url,
+            http_client=create_mcp_http_client(  # ty: ignore[unknown-argument]
+                headers=config.headers,
+                timeout=_httpx.Timeout(config.timeout, read=config.sse_read_timeout),
+            ),
+            terminate_on_close=config.terminate_on_close,
+        )
+    return streamable_http_client(
+        url=config.url,
+        headers=config.headers,
+        timeout=config.timeout,
+        sse_read_timeout=config.sse_read_timeout,
+        terminate_on_close=config.terminate_on_close,
+    )
+
+
 class MCPToolProvider(ToolProvider):
     """MCP tool provider that manages connections to multiple MCP servers.
 
@@ -307,15 +372,8 @@ class MCPToolProvider(ToolProvider):
                             )
                         )
                     case StreamableHttpServerConfig():
-                        read, write, _ = await stack.enter_async_context(
-                            streamablehttp_client(
-                                url=server_config.url,
-                                headers=server_config.headers,
-                                timeout=server_config.timeout,
-                                sse_read_timeout=server_config.sse_read_timeout,
-                                terminate_on_close=server_config.terminate_on_close,
-                            )
-                        )
+                        streams = await stack.enter_async_context(_streamable_http_streams(server_config))
+                        read, write = streams[0], streams[1]
                     case WebSocketServerConfig():
                         if websocket_client is None:
                             raise ImportError(
@@ -331,7 +389,8 @@ class MCPToolProvider(ToolProvider):
                 self._servers[name] = session
                 response = await session.list_tools()
                 self._tools[name] = [
-                    {"name": t.name, "description": t.description, "schema": t.inputSchema} for t in response.tools
+                    {"name": t.name, "description": t.description, "schema": _tool_input_schema(t)}
+                    for t in response.tools
                 ]
 
             try:
@@ -495,15 +554,8 @@ class MCPToolProvider(ToolProvider):
                         )
                     )
                 case StreamableHttpServerConfig():
-                    read, write, _ = await self._exit_stack.enter_async_context(
-                        streamablehttp_client(
-                            url=server_config.url,
-                            headers=server_config.headers,
-                            timeout=server_config.timeout,
-                            sse_read_timeout=server_config.sse_read_timeout,
-                            terminate_on_close=server_config.terminate_on_close,
-                        )
-                    )
+                    streams = await self._exit_stack.enter_async_context(_streamable_http_streams(server_config))
+                    read, write = streams[0], streams[1]
                 case WebSocketServerConfig():
                     if websocket_client is None:
                         raise ImportError(
@@ -519,7 +571,7 @@ class MCPToolProvider(ToolProvider):
             self._servers[name] = session
             response = await session.list_tools()
             self._tools[name] = [
-                {"name": t.name, "description": t.description, "schema": t.inputSchema} for t in response.tools
+                {"name": t.name, "description": t.description, "schema": _tool_input_schema(t)} for t in response.tools
             ]
 
         return self.get_all_tools()
